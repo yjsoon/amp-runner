@@ -1,0 +1,949 @@
+#!/bin/bash
+
+set -u
+
+PROGRAM_NAME=amp-runner
+LABEL_NAMESPACE=com.yjsoon.amp-runner
+UNIT_NAMESPACE=amp-runner
+SERVICE_PATH="$HOME/.local/bin:$HOME/.amp/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+SERVICE_LANG=en_US.UTF-8
+AMP_BIN=${AMP_RUNNER_AMP_BIN:-"$HOME/.amp/bin/amp"}
+CONFIG_ROOT=${XDG_CONFIG_HOME:-"$HOME/.config"}/amp-runner
+ALLOWED_ROOTS_FILE="$CONFIG_ROOT/allowed-roots"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  amp-runner start [directory]
+  amp-runner status [directory]
+  amp-runner stop [directory]
+  amp-runner list
+  amp-runner logs [-f|--follow] [directory]
+
+Directories default to the current directory.
+EOF
+}
+
+die() {
+  printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2
+  exit 1
+}
+
+reject_line_breaks() {
+  case $1 in
+    *$'\n'*|*$'\r'*) die "$2 contains a carriage return or newline" ;;
+  esac
+}
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+detect_platform() {
+  local detected
+  reject_line_breaks "$HOME" HOME
+  reject_line_breaks "$CONFIG_ROOT" "config path"
+  reject_line_breaks "$AMP_BIN" "Amp executable path"
+  detected=$(uname -s)
+  if [ "${AMP_RUNNER_TEST_MODE:-0}" = 1 ] && [ -n "${AMP_RUNNER_TEST_PLATFORM:-}" ]; then
+    detected=$AMP_RUNNER_TEST_PLATFORM
+  fi
+  case $detected in
+    Darwin|macos) PLATFORM=macos ;;
+    Linux|linux) PLATFORM=linux ;;
+    *) die "unsupported platform (macOS and Linux are supported)" ;;
+  esac
+
+  if [ "$PLATFORM" = macos ]; then
+    STATE_ROOT="$HOME/Library/Application Support/AmpRunners"
+    PROJECTS_DIR="$STATE_ROOT/projects"
+    LOCKS_DIR="$STATE_ROOT/locks"
+    GLOBAL_LOCK="$LOCKS_DIR/global.lock"
+    LOGS_ROOT="$HOME/Library/Logs/AmpRunners"
+    LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
+    LAUNCH_DOMAIN="gui/$(id -u)"
+  else
+    STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/amp-runner"
+    PROJECTS_DIR="$STATE_ROOT/projects"
+    LOCKS_DIR="$STATE_ROOT/locks"
+    GLOBAL_LOCK="$LOCKS_DIR/global.lock"
+    LOGS_ROOT="$STATE_ROOT/logs"
+    SYSTEMD_UNITS_DIR="$STATE_ROOT/systemd"
+  fi
+  reject_line_breaks "$STATE_ROOT" "state path"
+  reject_line_breaks "$LOGS_ROOT" "log path"
+}
+
+canonicalise_directory() {
+  local directory=${1:-.}
+  [ -d "$directory" ] || die "directory does not exist: $directory"
+  (unset CDPATH; cd -- "$directory" 2>/dev/null && { pwd -P; printf '\034'; }) \
+    || die "cannot access directory: $directory"
+}
+
+canonical_directory_value() {
+  local output
+  output=$(canonicalise_directory "$1") || exit 1
+  CANONICAL_DIRECTORY=${output%$'\034'}
+  CANONICAL_DIRECTORY=${CANONICAL_DIRECTORY%$'\n'}
+  reject_line_breaks "$CANONICAL_DIRECTORY" "directory path"
+}
+
+sha256_value() {
+  local value=$1 digest
+  if [ "$PLATFORM" = macos ] && command_exists shasum; then
+    digest=$(printf '%s' "$value" | shasum -a 256 | awk '{print $1}')
+  elif command_exists sha256sum; then
+    digest=$(printf '%s' "$value" | sha256sum | awk '{print $1}')
+  elif command_exists shasum; then
+    digest=$(printf '%s' "$value" | shasum -a 256 | awk '{print $1}')
+  else
+    die "no SHA-256 utility found (need shasum or sha256sum)"
+  fi
+  case $digest in
+    *[!0-9a-f]*|'') die "could not calculate a valid SHA-256 hash" ;;
+  esac
+  [ "${#digest}" -eq 64 ] || die "could not calculate a valid SHA-256 hash"
+  printf '%s\n' "$digest"
+}
+
+sha256_file() {
+  local file=$1 digest
+  if [ "$PLATFORM" = macos ] && command_exists shasum; then
+    digest=$(shasum -a 256 "$file" | awk '{print $1}')
+  elif command_exists sha256sum; then
+    digest=$(sha256sum "$file" | awk '{print $1}')
+  elif command_exists shasum; then
+    digest=$(shasum -a 256 "$file" | awk '{print $1}')
+  else
+    die "no SHA-256 utility found (need shasum or sha256sum)"
+  fi
+  case $digest in *[!0-9a-f]*|'') return 1 ;; esac
+  [ "${#digest}" -eq 64 ] || return 1
+  printf '%s\n' "$digest"
+}
+
+slugify() {
+  printf '%s' "$1" \
+    | LC_ALL=C tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'
+}
+
+host_slug() {
+  local host
+  if [ "$PLATFORM" = macos ] && command_exists scutil; then
+    host=$(scutil --get LocalHostName 2>/dev/null || hostname -s 2>/dev/null || hostname)
+  else
+    host=$(hostname -s 2>/dev/null || hostname)
+  fi
+  host=$(slugify "$host")
+  [ -n "$host" ] || host=host
+  printf '%.20s\n' "$host"
+}
+
+project_is_allowed() {
+  local project=$1 line comment_check root found=0
+  [ -f "$ALLOWED_ROOTS_FILE" ] || die "allowed-roots config not found: $ALLOWED_ROOTS_FILE (run install.sh)"
+  [ ! -L "$ALLOWED_ROOTS_FILE" ] || die "allowed-roots config must not be a symbolic link: $ALLOWED_ROOTS_FILE"
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    reject_line_breaks "$line" "allowed-roots entry"
+    comment_check=$(printf '%s' "$line" | sed 's/^[[:space:]]*//')
+    case $comment_check in ''|\#*) continue ;; esac
+    case $line in /*) ;; *) die "allowed root must be absolute: $line" ;; esac
+    canonical_directory_value "$line"
+    root=$CANONICAL_DIRECTORY
+    found=1
+    [ "$root" = / ] && return 0
+    case $project in
+      "$root"|"$root"/*) return 0 ;;
+    esac
+  done < "$ALLOWED_ROOTS_FILE"
+
+  [ "$found" -eq 1 ] || die "allowed-roots config contains no roots: $ALLOWED_ROOTS_FILE"
+  return 1
+}
+
+set_project_context() {
+  local requested=${1:-.} host
+  canonical_directory_value "$requested"
+  PROJECT_PATH=$CANONICAL_DIRECTORY
+  if ! project_is_allowed "$PROJECT_PATH"; then
+    die "directory is outside the configured allowed roots: $PROJECT_PATH"
+  fi
+
+  PROJECT_HASH=$(sha256_value "$PROJECT_PATH")
+  SHORT_HASH=${PROJECT_HASH:0:12}
+  PROJECT_SLUG=$(slugify "$(basename "$PROJECT_PATH")")
+  [ -n "$PROJECT_SLUG" ] || PROJECT_SLUG=project
+  PROJECT_SLUG=${PROJECT_SLUG:0:24}
+  host=$(host_slug)
+  RUNNER_ID="$host-$PROJECT_SLUG-$SHORT_HASH"
+  RUNNER_ID=${RUNNER_ID:0:63}
+  PROJECT_STATE_DIR="$PROJECTS_DIR/$PROJECT_HASH"
+  LOCK_FILE="$LOCKS_DIR/$PROJECT_HASH.lock"
+
+  if [ "$PLATFORM" = macos ]; then
+    SERVICE_NAME="$LABEL_NAMESPACE.$PROJECT_HASH"
+    SERVICE_FILE="$LAUNCH_AGENTS_DIR/$SERVICE_NAME.plist"
+    SERVICE_TARGET="$LAUNCH_DOMAIN/$SERVICE_NAME"
+    LOG_DIR="$LOGS_ROOT/$PROJECT_SLUG-$SHORT_HASH"
+  else
+    SERVICE_NAME="$UNIT_NAMESPACE-$PROJECT_HASH.service"
+    SERVICE_FILE="$SYSTEMD_UNITS_DIR/$SERVICE_NAME"
+    SERVICE_TARGET=$SERVICE_NAME
+    LOG_DIR="$LOGS_ROOT/$PROJECT_SLUG-$SHORT_HASH"
+  fi
+}
+
+ensure_private_roots() {
+  umask 077
+  reject_private_symlink "$STATE_ROOT"
+  reject_private_symlink "$PROJECTS_DIR"
+  reject_private_symlink "$LOCKS_DIR"
+  reject_private_symlink "$LOGS_ROOT"
+  mkdir -p "$STATE_ROOT" "$PROJECTS_DIR" "$LOCKS_DIR" "$LOGS_ROOT"
+  chmod 700 "$STATE_ROOT" "$PROJECTS_DIR" "$LOCKS_DIR" "$LOGS_ROOT"
+  if [ "$PLATFORM" = linux ]; then
+    reject_private_symlink "$SYSTEMD_UNITS_DIR"
+    mkdir -p "$SYSTEMD_UNITS_DIR"
+    chmod 700 "$SYSTEMD_UNITS_DIR"
+  fi
+}
+
+ensure_project_directories() {
+  reject_private_symlink "$PROJECT_STATE_DIR"
+  reject_private_symlink "$LOG_DIR"
+  mkdir -p "$PROJECT_STATE_DIR" "$LOG_DIR"
+  chmod 700 "$PROJECT_STATE_DIR" "$LOG_DIR"
+  : > "$LOG_DIR/.permission-check.$$" || die "cannot write logs in $LOG_DIR"
+  unlink "$LOG_DIR/.permission-check.$$" || die "cannot secure logs in $LOG_DIR"
+  touch "$LOG_DIR/amp.log" "$LOG_DIR/stdout.log" "$LOG_DIR/stderr.log" \
+    || die "cannot create logs in $LOG_DIR"
+  chmod 600 "$LOG_DIR/amp.log" "$LOG_DIR/stdout.log" "$LOG_DIR/stderr.log" \
+    || die "cannot secure logs in $LOG_DIR"
+}
+
+run_with_lock() {
+  local operation=$1 directory=$2
+  ensure_private_roots
+  if [ "$PLATFORM" = macos ]; then
+    command_exists lockf || die "lockf is required on macOS"
+    lockf -k -t 10 "$GLOBAL_LOCK" "$0" __project_lock "$operation" "$directory" \
+      || die "could not complete $operation for $directory (another operation may be running)"
+  else
+    command_exists flock || die "flock is required on Linux"
+    flock -w 10 "$GLOBAL_LOCK" "$0" __project_lock "$operation" "$directory" \
+      || die "could not complete $operation for $directory (another operation may be running)"
+  fi
+}
+
+run_with_project_lock() {
+  local operation=$1 directory=$2
+  [ ! -e "$CONFIG_ROOT/.uninstalling" ] || die "uninstall is in progress"
+  set_project_context "$directory"
+  ensure_private_roots
+  if [ "$PLATFORM" = macos ]; then
+    lockf -k -t 10 "$LOCK_FILE" "$0" "__$operation" "$PROJECT_PATH"
+  else
+    flock -w 10 "$LOCK_FILE" "$0" "__$operation" "$PROJECT_PATH"
+  fi
+}
+
+xml_escape() {
+  printf '%s' "$1" | sed \
+    -e 's/&/\&amp;/g' \
+    -e 's/</\&lt;/g' \
+    -e 's/>/\&gt;/g' \
+    -e 's/"/\&quot;/g' \
+    -e "s/'/\&apos;/g"
+}
+
+systemd_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g'
+}
+
+systemd_directive_escape() {
+  printf '%s' "$1" | sed \
+    -e 's/\\/\\x5c/g' \
+    -e 's/ /\\x20/g' \
+    -e $'s/\t/\\\\x09/g' \
+    -e 's/"/\\x22/g' \
+    -e "s/'/\\\\x27/g" \
+    -e 's/%/%%/g'
+}
+
+safe_remove_file() {
+  [ -e "$1" ] || [ -L "$1" ] || return 0
+  if [ "$PLATFORM" = macos ] && command_exists trash; then
+    trash "$1"
+  else
+    unlink "$1"
+  fi
+}
+
+safe_remove_tree() {
+  local target=$1
+  [ -e "$target" ] || [ -L "$target" ] || return 0
+  reject_line_breaks "$target" "removal path"
+  case $target in ''|/|"$HOME"|"$STATE_ROOT"|"$LOGS_ROOT") die "refusing unsafe removal path: $target" ;; esac
+  if [ "$PLATFORM" = macos ] && command_exists trash; then
+    trash "$target"
+  else
+    rm -rf -- "$target"
+  fi
+}
+
+reject_private_symlink() {
+  [ ! -L "$1" ] || die "private directory must not be a symbolic link: $1"
+}
+
+write_value_file() {
+  local value=$1 target=$2 temporary="$2.tmp.$$"
+  reject_line_breaks "$value" "metadata value"
+  printf '%s\n' "$value" > "$temporary" || die "cannot write $target"
+  chmod 600 "$temporary" || die "cannot secure $temporary"
+  mv -f "$temporary" "$target" || die "cannot install $target"
+}
+
+write_metadata() {
+  local service_digest
+  [ -f "$SERVICE_FILE" ] && [ ! -L "$SERVICE_FILE" ] \
+    || die "generated service definition is not a regular file: $SERVICE_FILE"
+  service_digest=$(sha256_file "$SERVICE_FILE") || die "cannot hash generated service definition"
+  write_value_file "$PROJECT_PATH" "$PROJECT_STATE_DIR/path"
+  write_value_file "$PLATFORM" "$PROJECT_STATE_DIR/platform"
+  write_value_file "$SERVICE_NAME" "$PROJECT_STATE_DIR/service-name"
+  write_value_file "$SERVICE_FILE" "$PROJECT_STATE_DIR/service-file"
+  write_value_file "$RUNNER_ID" "$PROJECT_STATE_DIR/runner-id"
+  write_value_file "$LOG_DIR" "$PROJECT_STATE_DIR/log-dir"
+  write_value_file "$service_digest" "$PROJECT_STATE_DIR/service-sha256"
+  write_value_file ready "$PROJECT_STATE_DIR/ready"
+}
+
+metadata_matches_context() {
+  local recorded_digest actual_digest
+  [ "$(sha256_value "$PROJECT_PATH")" = "$PROJECT_HASH" ] \
+    && [ -f "$PROJECT_STATE_DIR/ready" ] \
+    && [ "$(read_value "$PROJECT_STATE_DIR/path" 2>/dev/null || true)" = "$PROJECT_PATH" ] \
+    && [ "$(read_value "$PROJECT_STATE_DIR/platform" 2>/dev/null || true)" = "$PLATFORM" ] \
+    && [ "$(read_value "$PROJECT_STATE_DIR/service-name" 2>/dev/null || true)" = "$SERVICE_NAME" ] \
+    && [ "$(read_value "$PROJECT_STATE_DIR/service-file" 2>/dev/null || true)" = "$SERVICE_FILE" ] \
+    && [ "$(read_value "$PROJECT_STATE_DIR/runner-id" 2>/dev/null || true)" = "$RUNNER_ID" ] \
+    && [ "$(read_value "$PROJECT_STATE_DIR/log-dir" 2>/dev/null || true)" = "$LOG_DIR" ] \
+    && [ -f "$SERVICE_FILE" ] && [ ! -L "$SERVICE_FILE" ] \
+    || return 1
+  recorded_digest=$(read_value "$PROJECT_STATE_DIR/service-sha256" 2>/dev/null) || return 1
+  actual_digest=$(sha256_file "$SERVICE_FILE") || return 1
+  [ "$recorded_digest" = "$actual_digest" ]
+}
+
+read_value() {
+  local file=$1 value extra
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  IFS= read -r value < "$file" || [ -n "${value:-}" ] || return 1
+  reject_line_breaks "$value" "metadata"
+  extra=$(sed -n '2p' "$file")
+  [ -z "$extra" ] || return 1
+  printf '%s\n' "$value"
+}
+
+write_launchd_service() {
+  local temporary="$SERVICE_FILE.tmp.$$"
+  local amp_xml path_xml runner_xml home_xml env_path_xml log_xml stdout_xml stderr_xml
+  mkdir -p "$LAUNCH_AGENTS_DIR" || die "cannot create $LAUNCH_AGENTS_DIR"
+  amp_xml=$(xml_escape "$AMP_BIN")
+  path_xml=$(xml_escape "$PROJECT_PATH")
+  runner_xml=$(xml_escape "$RUNNER_ID")
+  home_xml=$(xml_escape "$HOME")
+  env_path_xml=$(xml_escape "$SERVICE_PATH")
+  log_xml=$(xml_escape "$LOG_DIR/amp.log")
+  stdout_xml=$(xml_escape "$LOG_DIR/stdout.log")
+  stderr_xml=$(xml_escape "$LOG_DIR/stderr.log")
+
+  cat > "$temporary" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$SERVICE_NAME</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>-i</string>
+    <string>HOME=$home_xml</string>
+    <string>PATH=$env_path_xml</string>
+    <string>LANG=$SERVICE_LANG</string>
+    <string>$amp_xml</string>
+    <string>--no-tui</string>
+    <string>--runner-id</string>
+    <string>$runner_xml</string>
+    <string>--no-ide</string>
+    <string>--no-notifications</string>
+    <string>--no-remote-control-terminal</string>
+    <string>--log-file</string>
+    <string>$log_xml</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>$path_xml</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>$stdout_xml</string>
+  <key>StandardErrorPath</key>
+  <string>$stderr_xml</string>
+</dict>
+</plist>
+EOF
+  [ -s "$temporary" ] || die "cannot write generated launchd plist"
+  chmod 600 "$temporary" || die "cannot secure generated launchd plist"
+  if ! plutil -lint "$temporary" >/dev/null; then
+    safe_remove_file "$temporary"
+    die "generated launchd plist failed validation"
+  fi
+  mv -f "$temporary" "$SERVICE_FILE" || die "cannot install generated launchd plist"
+}
+
+write_systemd_service() {
+  local temporary="$SERVICE_FILE.tmp.$$"
+  local work amp home path runner amp_log stdout_log stderr_log
+  work=$(systemd_directive_escape "$PROJECT_PATH")
+  amp=$(systemd_escape "$AMP_BIN")
+  home=$(systemd_escape "$HOME")
+  path=$(systemd_escape "$SERVICE_PATH")
+  runner=$(systemd_escape "$RUNNER_ID")
+  amp_log=$(systemd_escape "$LOG_DIR/amp.log")
+  stdout_log=$(systemd_directive_escape "$LOG_DIR/stdout.log")
+  stderr_log=$(systemd_directive_escape "$LOG_DIR/stderr.log")
+  cat > "$temporary" <<EOF
+[Unit]
+Description=Amp runner for $runner
+
+[Service]
+Type=simple
+WorkingDirectory=$work
+ExecStart=/usr/bin/env -i "HOME=$home" "PATH=$path" "LANG=$SERVICE_LANG" "$amp" --no-tui --runner-id "$runner" --no-ide --no-notifications --no-remote-control-terminal --log-file "$amp_log"
+Restart=always
+RestartSec=10
+StandardOutput=append:$stdout_log
+StandardError=append:$stderr_log
+
+[Install]
+WantedBy=default.target
+EOF
+  [ -s "$temporary" ] || die "cannot write generated systemd unit"
+  chmod 600 "$temporary" || die "cannot secure generated systemd unit"
+  mv -f "$temporary" "$SERVICE_FILE" || die "cannot install generated systemd unit"
+}
+
+write_service() {
+  if [ "$PLATFORM" = macos ]; then
+    write_launchd_service
+  else
+    write_systemd_service
+  fi
+}
+
+service_is_loaded() {
+  local load_state
+  if [ "$PLATFORM" = macos ]; then
+    launchctl print "$SERVICE_TARGET" >/dev/null 2>&1
+  else
+    load_state=$(systemctl --user show "$SERVICE_NAME" -p LoadState --value 2>/dev/null) \
+      || die "systemd user manager could not inspect $SERVICE_NAME"
+    [ "$load_state" != not-found ] && [ -n "$load_state" ]
+  fi
+}
+
+service_is_active() {
+  local active_state
+  if [ "$PLATFORM" = macos ]; then
+    service_is_loaded
+  else
+    active_state=$(systemctl --user show "$SERVICE_NAME" -p ActiveState --value 2>/dev/null) \
+      || die "systemd user manager could not inspect $SERVICE_NAME"
+    case $active_state in
+      active|activating|reloading|deactivating) return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+}
+
+service_pid() {
+  local pid
+  if [ "$PLATFORM" = macos ]; then
+    launchctl print "$SERVICE_TARGET" 2>/dev/null | awk '/^[[:space:]]*pid = / { print $3; exit }'
+  else
+    pid=$(systemctl --user show "$SERVICE_NAME" -p MainPID --value 2>/dev/null || true)
+    case $pid in ''|0|*[!0-9]*) return 0 ;; esac
+    printf '%s\n' "$pid"
+  fi
+}
+
+service_state() {
+  if [ "$PLATFORM" = macos ]; then
+    launchctl print "$SERVICE_TARGET" 2>/dev/null | awk '/^[[:space:]]*state = / { print $3; exit }'
+  else
+    systemctl --user show "$SERVICE_NAME" -p ActiveState --value 2>/dev/null || true
+  fi
+}
+
+require_service_manager() {
+  if [ "$PLATFORM" = macos ]; then
+    command_exists launchctl || die "launchctl is required on macOS"
+    launchctl print "$LAUNCH_DOMAIN" >/dev/null 2>&1 \
+      || die "launchd user domain is unavailable: $LAUNCH_DOMAIN"
+  else
+    command_exists systemctl || die "systemctl is required on Linux"
+    systemctl --user show-environment >/dev/null 2>&1 \
+      || die "systemd user manager is unavailable"
+  fi
+}
+
+process_cwd() {
+  local pid=$1 cwd
+  if [ "$PLATFORM" = linux ] && [ -L "/proc/$pid/cwd" ]; then
+    cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || true)
+    [ -n "$cwd" ] && { printf '%s\n' "$cwd"; return 0; }
+  fi
+  if command_exists lsof; then
+    lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | sed -n '1p'
+  fi
+}
+
+other_runner_pid() {
+  local pid_file pid command cwd
+  for pid_file in "$HOME/.cache/amp/pids"/runner-*.pid; do
+    [ -f "$pid_file" ] || continue
+    pid=$(sed -n '1p' "$pid_file" 2>/dev/null || true)
+    case $pid in *[!0-9]*|'') continue ;; esac
+    command=$(ps -p "$pid" -o command= 2>/dev/null || true)
+    case $command in
+      *amp*--no-tui*) ;;
+      *) continue ;;
+    esac
+    cwd=$(process_cwd "$pid")
+    [ "$cwd" = "$PROJECT_PATH" ] || continue
+    printf '%s\n' "$pid"
+    return 0
+  done
+  return 1
+}
+
+wait_for_process_exit() {
+  local pid=$1 attempts=0
+  [ -n "$pid" ] || return 0
+  while kill -0 "$pid" 2>/dev/null && [ "$attempts" -lt 100 ]; do
+    attempts=$((attempts + 1))
+    sleep 0.1
+  done
+  ! kill -0 "$pid" 2>/dev/null
+}
+
+backend_start() {
+  if [ "$PLATFORM" = macos ]; then
+    launchctl bootstrap "$LAUNCH_DOMAIN" "$SERVICE_FILE"
+  else
+    systemctl --user daemon-reload \
+      && systemctl --user enable --now "$SERVICE_FILE"
+  fi
+}
+
+backend_stop() {
+  if [ "$PLATFORM" = macos ]; then
+    launchctl bootout "$SERVICE_TARGET"
+  else
+    systemctl --user disable --now "$SERVICE_NAME"
+  fi
+}
+
+remove_service_file() {
+  safe_remove_file "$SERVICE_FILE" || die "cannot remove generated service file: $SERVICE_FILE"
+  if [ "$PLATFORM" = linux ]; then
+    systemctl --user daemon-reload >/dev/null || die "systemd user manager could not reload units"
+  fi
+}
+
+start_runner() {
+  local pid existing_pid attempts
+  set_project_context "${1:-.}"
+  reject_line_breaks "$HOME" HOME
+  reject_line_breaks "$AMP_BIN" "Amp executable path"
+  [ -x "$AMP_BIN" ] || die "Amp executable is not executable: $AMP_BIN"
+  ensure_private_roots
+  require_service_manager
+
+  if service_is_loaded; then
+    metadata_matches_context || die "service name is already in use but is not recorded as amp-runner-managed: $SERVICE_NAME"
+    if [ "$PLATFORM" = macos ] || service_is_active; then
+      printf 'Amp runner is already managed for %s' "$PROJECT_PATH"
+      pid=$(service_pid)
+      [ -n "$pid" ] && printf ' (pid %s)' "$pid"
+      printf '\n'
+      return 0
+    fi
+  fi
+  if { [ -e "$SERVICE_FILE" ] || [ -L "$SERVICE_FILE" ]; } && ! metadata_matches_context; then
+    die "service definition exists without matching amp-runner metadata; leaving it untouched: $SERVICE_FILE"
+  fi
+
+  existing_pid=$(other_runner_pid || true)
+  if [ -n "$existing_pid" ]; then
+    printf 'Amp runner already exists outside amp-runner for %s (pid %s); leaving it untouched.\n' "$PROJECT_PATH" "$existing_pid"
+    return 0
+  fi
+
+  ensure_project_directories
+  write_service
+  write_metadata
+  if ! backend_start; then
+    if service_is_active && metadata_matches_context; then
+      printf 'Amp runner became managed concurrently for %s.\n' "$PROJECT_PATH"
+      return 0
+    fi
+    backend_stop >/dev/null 2>&1 || true
+    [ "$PLATFORM" = macos ] || systemctl --user daemon-reload >/dev/null 2>&1 || true
+    die "$PLATFORM service manager could not start $SERVICE_NAME"
+  fi
+
+  attempts=0
+  while [ "$attempts" -lt 50 ]; do
+    pid=$(service_pid)
+    if service_is_active && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      sleep 1
+      if service_is_active && [ "$(service_pid)" = "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        printf 'Started Amp runner %s for %s (pid %s).\n' "$RUNNER_ID" "$PROJECT_PATH" "$pid"
+        printf 'Logs: %s\n' "$LOG_DIR"
+        return 0
+      fi
+    fi
+    attempts=$((attempts + 1))
+    sleep 0.2
+  done
+
+  pid=$(service_pid)
+  backend_stop >/dev/null 2>&1 || true
+  wait_for_process_exit "$pid" || printf '%s: warning: process %s is still exiting\n' "$PROGRAM_NAME" "$pid" >&2
+  printf '%s: the service loaded, but Amp did not remain running; inspect %s\n' "$PROGRAM_NAME" "$LOG_DIR/stderr.log" >&2
+  return 1
+}
+
+status_runner() {
+  local pid state existing_pid
+  set_project_context "${1:-.}"
+  require_service_manager
+  if service_is_loaded; then
+    metadata_matches_context || die "matching service is not recorded as amp-runner-managed; leaving it untouched: $SERVICE_NAME"
+    if [ "$PLATFORM" = linux ] && ! service_is_active; then
+      printf 'stopped: %s\n' "$PROJECT_PATH"
+      return 0
+    fi
+    pid=$(service_pid)
+    state=$(service_state)
+    printf 'managed: %s\n' "$PROJECT_PATH"
+    printf 'runner:  %s\n' "$RUNNER_ID"
+    printf 'state:   %s\n' "${state:-unknown}"
+    printf 'pid:     %s\n' "${pid:-not running}"
+    printf 'logs:    %s\n' "$LOG_DIR"
+    return 0
+  fi
+  existing_pid=$(other_runner_pid || true)
+  if [ -n "$existing_pid" ]; then
+    printf 'unmanaged: %s (pid %s)\n' "$PROJECT_PATH" "$existing_pid"
+  else
+    printf 'stopped: %s\n' "$PROJECT_PATH"
+  fi
+}
+
+stop_runner() {
+  local pid attempts existing_pid
+  set_project_context "${1:-.}"
+  ensure_private_roots
+  require_service_manager
+  if service_is_loaded; then
+    metadata_matches_context || die "matching service is not recorded as amp-runner-managed; leaving it untouched: $SERVICE_NAME"
+    pid=$(service_pid)
+    backend_stop || die "$PLATFORM service manager could not stop $SERVICE_NAME"
+    attempts=0
+    if [ "$PLATFORM" = macos ]; then
+      while service_is_loaded && [ "$attempts" -lt 50 ]; do
+        attempts=$((attempts + 1))
+        sleep 0.1
+      done
+      service_is_loaded && die "$PLATFORM service manager still reports $SERVICE_NAME as loaded"
+    else
+      while service_is_active && [ "$attempts" -lt 50 ]; do
+        attempts=$((attempts + 1))
+        sleep 0.1
+      done
+      service_is_active && die "$PLATFORM service manager still reports $SERVICE_NAME as active"
+    fi
+    wait_for_process_exit "$pid" || die "Amp process $pid did not exit after the service stopped"
+    printf 'Stopped managed Amp runner for %s.\n' "$PROJECT_PATH"
+    return 0
+  fi
+  existing_pid=$(other_runner_pid || true)
+  if [ -n "$existing_pid" ]; then
+    printf 'Amp runner for %s is unmanaged (pid %s); leaving it untouched.\n' "$PROJECT_PATH" "$existing_pid"
+  else
+    printf 'Amp runner is already stopped for %s.\n' "$PROJECT_PATH"
+  fi
+}
+
+load_hash_context() {
+  local hash=$1 dir value calculated_hash runner_suffix
+  case $hash in *[!0-9a-f]*|'') return 1 ;; esac
+  [ "${#hash}" -eq 64 ] || return 1
+  dir="$PROJECTS_DIR/$hash"
+  [ -f "$dir/ready" ] || return 1
+  value=$(read_value "$dir/platform") || return 1
+  [ "$value" = "$PLATFORM" ] || return 1
+  PROJECT_HASH=$hash
+  PROJECT_STATE_DIR=$dir
+  PROJECT_PATH=$(read_value "$dir/path") || return 1
+  case $PROJECT_PATH in /*) ;; *) return 1 ;; esac
+  calculated_hash=$(sha256_value "$PROJECT_PATH")
+  [ "$calculated_hash" = "$hash" ] || return 1
+  SERVICE_NAME=$(read_value "$dir/service-name") || return 1
+  SERVICE_FILE=$(read_value "$dir/service-file") || return 1
+  RUNNER_ID=$(read_value "$dir/runner-id") || return 1
+  runner_suffix=${RUNNER_ID##*-}
+  [ "$runner_suffix" = "${hash:0:12}" ] || return 1
+  [ "${#RUNNER_ID}" -le 63 ] || return 1
+  case $RUNNER_ID in *[!a-z0-9-]*|'') return 1 ;; esac
+  LOG_DIR=$(read_value "$dir/log-dir") || return 1
+  LOCK_FILE="$LOCKS_DIR/$hash.lock"
+  if [ "$PLATFORM" = macos ]; then
+    SERVICE_TARGET="$LAUNCH_DOMAIN/$SERVICE_NAME"
+    case $SERVICE_NAME in "$LABEL_NAMESPACE."*) ;; *) return 1 ;; esac
+    [ "$SERVICE_FILE" = "$LAUNCH_AGENTS_DIR/$SERVICE_NAME.plist" ] || return 1
+  else
+    SERVICE_TARGET=$SERVICE_NAME
+    [ "$SERVICE_NAME" = "$UNIT_NAMESPACE-$hash.service" ] || return 1
+    [ "$SERVICE_FILE" = "$SYSTEMD_UNITS_DIR/$SERVICE_NAME" ] || return 1
+  fi
+  [ -f "$SERVICE_FILE" ] && [ ! -L "$SERVICE_FILE" ] || return 1
+  value=$(read_value "$dir/service-sha256") || return 1
+  [ "$(sha256_file "$SERVICE_FILE")" = "$value" ] || return 1
+}
+
+list_runners() {
+  local state_dir hash status pid found=0 saved_platform
+  require_service_manager
+  printf '%-10s %-7s %-48s %s\n' STATUS PID RUNNER DIRECTORY
+  for state_dir in "$PROJECTS_DIR"/*; do
+    [ -d "$state_dir" ] || continue
+    hash=${state_dir##*/}
+    saved_platform=$PLATFORM
+    load_hash_context "$hash" || { PLATFORM=$saved_platform; continue; }
+    found=1
+    if service_is_loaded && { [ "$PLATFORM" = macos ] || service_is_active; }; then
+      status=managed
+      pid=$(service_pid)
+    else
+      status=stopped
+      pid=-
+    fi
+    printf '%-10s %-7s %-48s %s\n' "$status" "${pid:--}" "$RUNNER_ID" "$PROJECT_PATH"
+  done
+  [ "$found" -eq 1 ] || printf '%s\n' '(no amp-runner projects recorded)'
+}
+
+show_logs() {
+  local follow=0 directory=. file files_count=0
+  local files=()
+  case ${1:-} in
+    -f|--follow)
+      follow=1
+      directory=${2:-.}
+      [ "$#" -le 2 ] || die "too many arguments for logs"
+      ;;
+    *)
+      directory=${1:-.}
+      [ "$#" -le 1 ] || die "too many arguments for logs"
+      ;;
+  esac
+  set_project_context "$directory"
+  printf 'Logs: %s\n' "$LOG_DIR"
+  for file in "$LOG_DIR/amp.log" "$LOG_DIR/stdout.log" "$LOG_DIR/stderr.log"; do
+    if [ -f "$file" ]; then
+      files+=("$file")
+      files_count=$((files_count + 1))
+    fi
+  done
+  [ "$files_count" -gt 0 ] || die "no logs exist for $PROJECT_PATH"
+  if [ "$follow" -eq 1 ]; then
+    tail -n 100 -F "${files[@]}"
+  else
+    tail -n 100 "${files[@]}"
+  fi
+}
+
+debug_context() {
+  [ "${AMP_RUNNER_TEST_MODE:-0}" = 1 ] || die "unknown command: debug"
+  [ "$#" -le 1 ] || die "too many arguments for debug"
+  set_project_context "${1:-.}"
+  printf 'platform=%s\n' "$PLATFORM"
+  printf 'project_path=%s\n' "$PROJECT_PATH"
+  printf 'project_hash=%s\n' "$PROJECT_HASH"
+  printf 'runner_id=%s\n' "$RUNNER_ID"
+  printf 'service_name=%s\n' "$SERVICE_NAME"
+  printf 'service_file=%s\n' "$SERVICE_FILE"
+  printf 'state_dir=%s\n' "$PROJECT_STATE_DIR"
+  printf 'log_dir=%s\n' "$LOG_DIR"
+}
+
+debug_service() {
+  [ "${AMP_RUNNER_TEST_MODE:-0}" = 1 ] || die "unknown command: debug-service"
+  [ "$#" -le 1 ] || die "too many arguments for debug-service"
+  set_project_context "${1:-.}"
+  [ -x "$AMP_BIN" ] || die "Amp executable is not executable: $AMP_BIN"
+  ensure_private_roots
+  ensure_project_directories
+  write_service
+  write_metadata
+  printf '%s\n' "$SERVICE_FILE"
+}
+
+stop_hash() {
+  local hash=$1 pid
+  load_hash_context "$hash" || die "invalid managed project metadata: $hash"
+  if service_is_loaded; then
+    pid=$(service_pid)
+    backend_stop || die "could not stop managed service $SERVICE_NAME"
+    wait_for_process_exit "$pid" || die "managed Amp process $pid did not exit"
+  fi
+  safe_remove_file "$SERVICE_FILE" || die "cannot remove $SERVICE_FILE"
+  [ "$PLATFORM" = macos ] || systemctl --user daemon-reload >/dev/null \
+    || die "systemd user manager could not reload units"
+  safe_remove_tree "$LOG_DIR" || die "cannot remove managed logs: $LOG_DIR"
+  safe_remove_tree "$PROJECT_STATE_DIR" || die "cannot remove managed metadata: $PROJECT_STATE_DIR"
+  safe_remove_file "$LOCK_FILE" || die "cannot remove managed lock: $LOCK_FILE"
+  printf 'Removed managed service for %s.\n' "$PROJECT_PATH"
+}
+
+uninstall_clean() {
+  local state_dir hash
+  [ "${AMP_RUNNER_UNINSTALL:-0}" = 1 ] || die "invalid internal invocation"
+  ensure_private_roots
+  for state_dir in "$PROJECTS_DIR"/*; do
+    [ -d "$state_dir" ] || continue
+    hash=${state_dir##*/}
+    load_hash_context "$hash" || die "invalid managed project metadata: $state_dir"
+    if [ "$PLATFORM" = macos ]; then
+      lockf -k -t 10 "$LOCK_FILE" "$0" __stop_hash "$hash" \
+        || die "could not lock managed project $hash during uninstall"
+    else
+      flock -w 10 "$LOCK_FILE" "$0" __stop_hash "$hash" \
+        || die "could not lock managed project $hash during uninstall"
+    fi
+  done
+  if [ "$PLATFORM" = linux ]; then
+    rmdir "$SYSTEMD_UNITS_DIR" "$LOGS_ROOT" 2>/dev/null || true
+  fi
+  rmdir "$PROJECTS_DIR" 2>/dev/null || true
+  if [ "$PLATFORM" = macos ]; then
+    rmdir "$LOGS_ROOT" 2>/dev/null || true
+  fi
+}
+
+mark_uninstalling() {
+  [ ! -L "$CONFIG_ROOT" ] || die "config directory must not be a symbolic link: $CONFIG_ROOT"
+  mkdir -p "$CONFIG_ROOT" || die "cannot create $CONFIG_ROOT"
+  chmod 700 "$CONFIG_ROOT" || die "cannot secure $CONFIG_ROOT"
+  write_value_file uninstalling "$CONFIG_ROOT/.uninstalling"
+}
+
+uninstall_locked() {
+  local force=$1 state_dir hash active=0
+  [ "${AMP_RUNNER_UNINSTALL:-0}" = 1 ] || die "invalid internal invocation"
+  require_service_manager
+  ensure_private_roots
+  for state_dir in "$PROJECTS_DIR"/*; do
+    [ -d "$state_dir" ] || continue
+    hash=${state_dir##*/}
+    load_hash_context "$hash" || die "invalid managed project metadata: $state_dir"
+    if service_is_active; then
+      printf 'active: %s (%s)\n' "$PROJECT_PATH" "$SERVICE_NAME"
+      active=1
+    fi
+  done
+  if [ "$active" -eq 1 ] && [ "$force" -ne 1 ]; then
+    return 3
+  fi
+  uninstall_clean
+  mark_uninstalling
+}
+
+uninstall_transaction() {
+  local force=$1
+  [ "${AMP_RUNNER_UNINSTALL:-0}" = 1 ] || die "invalid internal invocation"
+  ensure_private_roots
+  if [ "$PLATFORM" = macos ]; then
+    command_exists lockf || die "lockf is required on macOS"
+    lockf -k -t 10 "$GLOBAL_LOCK" "$0" __uninstall_locked "$force"
+  else
+    command_exists flock || die "flock is required on Linux"
+    flock -w 10 "$GLOBAL_LOCK" "$0" __uninstall_locked "$force"
+  fi
+}
+
+main() {
+  local command=${1:-}
+  umask 077
+  detect_platform
+  [ -n "$command" ] || { usage; exit 1; }
+  shift || true
+  case $command in
+    start)
+      [ "$#" -le 1 ] || die "too many arguments for start"
+      run_with_lock start "${1:-.}"
+      ;;
+    status)
+      [ "$#" -le 1 ] || die "too many arguments for status"
+      status_runner "${1:-.}"
+      ;;
+    stop)
+      [ "$#" -le 1 ] || die "too many arguments for stop"
+      run_with_lock stop "${1:-.}"
+      ;;
+    list)
+      [ "$#" -eq 0 ] || die "list does not accept arguments"
+      list_runners
+      ;;
+    logs) show_logs "$@" ;;
+    -h|--help|help) [ "$#" -eq 0 ] || die "help does not accept arguments"; usage ;;
+    debug) debug_context "$@" ;;
+    debug-service) debug_service "$@" ;;
+    __start|__stop)
+      [ "$#" -eq 1 ] || die "invalid internal invocation"
+      if [ "$command" = __start ]; then start_runner "$1"; else stop_runner "$1"; fi
+      ;;
+    __project_lock)
+      [ "$#" -eq 2 ] || die "invalid internal invocation"
+      case $1 in start|stop) run_with_project_lock "$1" "$2" ;; *) die "invalid internal operation" ;; esac
+      ;;
+    __uninstall)
+      [ "$#" -eq 1 ] || die "invalid internal invocation"
+      case $1 in 0|1) uninstall_transaction "$1" ;; *) die "invalid uninstall mode" ;; esac
+      ;;
+    __uninstall_locked)
+      [ "${AMP_RUNNER_UNINSTALL:-0}" = 1 ] && [ "$#" -eq 1 ] || die "invalid internal invocation"
+      uninstall_locked "$1"
+      ;;
+    __stop_hash)
+      [ "${AMP_RUNNER_UNINSTALL:-0}" = 1 ] && [ "$#" -eq 1 ] || die "invalid internal invocation"
+      stop_hash "$1"
+      ;;
+    *) usage >&2; die "unknown command: $command" ;;
+  esac
+}
+
+main "$@"
