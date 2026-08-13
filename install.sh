@@ -54,7 +54,7 @@ check_prerequisites() {
   reject_line_breaks "$CONFIG_ROOT" "config path"
   reject_line_breaks "$AMP_BIN" "Amp executable path"
   [ -x "$AMP_BIN" ] || die "Amp executable is not executable: $AMP_BIN"
-  for tool in awk basename chmod cp dirname hostname id mkdir mv sed tail touch tr uname unlink; do
+  for tool in awk basename chmod cp dirname git hostname id mkdir mv sed tail touch tr uname unlink; do
     need_command "$tool"
   done
   case $(uname -s) in

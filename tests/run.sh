@@ -63,9 +63,17 @@ run_debug() {
     AMP_RUNNER_AMP_BIN="$FAKE_AMP" "$CLI" debug "$1"
 }
 
-printf '1..21\n'
+run_ensure() {
+  HOME="$TEST_HOME" XDG_CONFIG_HOME="$TEST_CONFIG" XDG_STATE_HOME="$TEST_STATE" \
+    PATH="$TEST_BIN:$PATH" AMP_RUNNER_TEST_MODE=1 AMP_RUNNER_TEST_PLATFORM=macos \
+    AMP_RUNNER_TEST_SENTINEL="$TEST_SENTINEL" AMP_RUNNER_AMP_BIN="$FAKE_AMP" \
+    "$CLI" ensure "$1" --repo "$2"
+}
+
+printf '1..34\n'
 
 help_output=$("$CLI" --help 2>&1)
+assert_contains "help lists ensure's exact argument order" "$help_output" "amp-runner ensure <directory> --repo <git-url>"
 assert_contains "help lists start" "$help_output" "amp-runner start [directory]"
 assert_contains "help lists follow logs" "$help_output" "logs [-f|--follow] [directory]"
 
@@ -77,11 +85,13 @@ PROJECT="$ALLOWED/project alpha"
 OUTSIDE="$TEST_HOME/outside"
 FAKE_AMP="$TEST_HOME/.amp/bin/amp"
 TEST_BIN="$TEST_ROOT/bin"
+TEST_SENTINEL="$TEST_ROOT/service-or-amp-ran"
 mkdir -p "$PROJECT" "$OUTSIDE" "$(dirname "$FAKE_AMP")" "$TEST_CONFIG/amp-runner" "$TEST_BIN"
-printf '#!/bin/sh\nexit 0\n' > "$FAKE_AMP"
+printf '#!/bin/sh\n[ -z "${AMP_RUNNER_TEST_SENTINEL:-}" ] || touch "$AMP_RUNNER_TEST_SENTINEL"\nexit 0\n' > "$FAKE_AMP"
 chmod 700 "$FAKE_AMP"
 printf '#!/bin/sh\nexit 0\n' > "$TEST_BIN/plutil"
-chmod 700 "$TEST_BIN/plutil"
+printf '#!/bin/sh\n[ -z "${AMP_RUNNER_TEST_SENTINEL:-}" ] || touch "$AMP_RUNNER_TEST_SENTINEL"\nexit 97\n' > "$TEST_BIN/launchctl"
+chmod 700 "$TEST_BIN/plutil" "$TEST_BIN/launchctl"
 printf '%s\n' "$ALLOWED" > "$TEST_CONFIG/amp-runner/allowed-roots"
 chmod 700 "$TEST_CONFIG/amp-runner"
 chmod 600 "$TEST_CONFIG/amp-runner/allowed-roots"
@@ -153,6 +163,135 @@ if grep -q 'remove_service_file' <(sed -n '/^stop_runner()/,/^}/p' "$CLI"); then
   fail "stop retains service definitions and metadata for restart, list, and uninstall"
 else
   pass "stop retains service definitions and metadata for restart, list, and uninstall"
+fi
+
+REMOTE_ONE="$TEST_ROOT/remote-one.git"
+REMOTE_TWO="$TEST_ROOT/remote-two.git"
+git init -q --bare "$REMOTE_ONE"
+git init -q --bare "$REMOTE_TWO"
+
+ENSURE_ABSENT="$ALLOWED/ensured absent"
+ensure_absent_output=$(run_ensure "$ENSURE_ABSENT" "$REMOTE_ONE" 2>&1)
+if [ -d "$ENSURE_ABSENT/.git" ] \
+  && [ "$(git -C "$ENSURE_ABSENT" config --get remote.origin.url)" = "$REMOTE_ONE" ]; then
+  assert_contains "ensure clones an absent destination" "$ensure_absent_output" \
+    "Cloned $REMOTE_ONE into $CANONICAL_ALLOWED/ensured absent"
+else
+  fail "ensure clones an absent destination"
+fi
+
+ensure_repeat_output=$(run_ensure "$ENSURE_ABSENT" "$REMOTE_ONE///" 2>&1)
+assert_contains "ensure is idempotent and applies only documented URL normalisation" \
+  "$ensure_repeat_output" "Verified existing checkout at $CANONICAL_ALLOWED/ensured absent"
+
+ENSURE_EXISTING="$ALLOWED/matching existing checkout"
+git clone -q -- "$REMOTE_ONE" "$ENSURE_EXISTING" 2>/dev/null
+ensure_existing_output=$(run_ensure "$ENSURE_EXISTING" "$REMOTE_ONE" 2>&1)
+assert_contains "ensure accepts a matching existing checkout" \
+  "$ensure_existing_output" "Verified existing checkout at $CANONICAL_ALLOWED/matching existing checkout"
+
+ENSURE_MISMATCH="$ALLOWED/mismatched checkout"
+git clone -q -- "$REMOTE_ONE" "$ENSURE_MISMATCH" 2>/dev/null
+if run_ensure "$ENSURE_MISMATCH" "$REMOTE_TWO" >"$TEST_ROOT/mismatch.out" 2>&1; then
+  fail "ensure refuses a mismatched origin without changing it"
+elif case $(cat "$TEST_ROOT/mismatch.out") in
+    *"repository URL mismatch"*"expected: $REMOTE_TWO"*"actual:   $REMOTE_ONE"*) true ;;
+    *) false ;;
+  esac \
+  && [ "$(git -C "$ENSURE_MISMATCH" config --get remote.origin.url)" = "$REMOTE_ONE" ]; then
+  pass "ensure refuses a mismatched origin without changing it"
+else
+  fail "ensure refuses a mismatched origin without changing it"
+fi
+
+ENSURE_UNRELATED="$ALLOWED/unrelated nonempty"
+mkdir "$ENSURE_UNRELATED"
+printf 'keep\n' > "$ENSURE_UNRELATED/content.txt"
+if run_ensure "$ENSURE_UNRELATED" "$REMOTE_ONE" >"$TEST_ROOT/unrelated.out" 2>&1; then
+  fail "ensure refuses and preserves an unrelated nonempty directory"
+elif [ "$(cat "$ENSURE_UNRELATED/content.txt")" = keep ]; then
+  assert_contains "ensure refuses and preserves an unrelated nonempty directory" \
+    "$(cat "$TEST_ROOT/unrelated.out")" "not a Git worktree root"
+else
+  fail "ensure refuses and preserves an unrelated nonempty directory"
+fi
+
+ENSURE_EMPTY="$ALLOWED/existing empty"
+mkdir "$ENSURE_EMPTY"
+ensure_empty_output=$(run_ensure "$ENSURE_EMPTY" "$REMOTE_ONE" 2>&1)
+if [ -d "$ENSURE_EMPTY/.git" ]; then
+  assert_contains "ensure supports an existing empty destination" \
+    "$ensure_empty_output" "Cloned $REMOTE_ONE into $CANONICAL_ALLOWED/existing empty"
+else
+  fail "ensure supports an existing empty destination"
+fi
+
+ENSURE_OUTSIDE="$OUTSIDE/outside clone"
+if run_ensure "$ENSURE_OUTSIDE" "$REMOTE_ONE" >"$TEST_ROOT/outside-ensure.out" 2>&1; then
+  fail "ensure refuses a path outside allowed roots"
+elif [ ! -e "$ENSURE_OUTSIDE" ]; then
+  assert_contains "ensure refuses a path outside allowed roots" \
+    "$(cat "$TEST_ROOT/outside-ensure.out")" "outside the configured allowed roots"
+else
+  fail "ensure refuses a path outside allowed roots"
+fi
+
+ENSURE_SYMLINK="$ALLOWED/symlink destination"
+ln -s "$PROJECT" "$ENSURE_SYMLINK"
+if run_ensure "$ENSURE_SYMLINK" "$REMOTE_ONE" >"$TEST_ROOT/symlink-ensure.out" 2>&1; then
+  fail "ensure refuses a symlink destination"
+elif [ -L "$ENSURE_SYMLINK" ]; then
+  assert_contains "ensure refuses a symlink destination" \
+    "$(cat "$TEST_ROOT/symlink-ensure.out")" "must not be a symbolic link"
+else
+  fail "ensure refuses a symlink destination"
+fi
+
+if [ ! -e "$TEST_SENTINEL" ]; then
+  pass "ensure test mode does not run Amp or a service manager"
+else
+  fail "ensure test mode does not run Amp or a service manager"
+fi
+
+if HOME="$TEST_HOME" XDG_CONFIG_HOME="$TEST_CONFIG" XDG_STATE_HOME="$TEST_STATE" \
+    AMP_RUNNER_TEST_MODE=1 AMP_RUNNER_TEST_PLATFORM=macos "$CLI" \
+    ensure --repo "$REMOTE_ONE" "$ENSURE_ABSENT" >"$TEST_ROOT/order.out" 2>&1 \
+  || HOME="$TEST_HOME" XDG_CONFIG_HOME="$TEST_CONFIG" XDG_STATE_HOME="$TEST_STATE" \
+    AMP_RUNNER_TEST_MODE=1 AMP_RUNNER_TEST_PLATFORM=macos "$CLI" \
+    ensure "$ENSURE_ABSENT" --repo "$REMOTE_ONE" extra >>"$TEST_ROOT/order.out" 2>&1 \
+  || HOME="$TEST_HOME" XDG_CONFIG_HOME="$TEST_CONFIG" XDG_STATE_HOME="$TEST_STATE" \
+    AMP_RUNNER_TEST_MODE=1 AMP_RUNNER_TEST_PLATFORM=macos "$CLI" \
+    ensure "$ENSURE_ABSENT" --repo >>"$TEST_ROOT/order.out" 2>&1; then
+  fail "ensure rejects missing, reordered, and extra arguments"
+else
+  assert_contains "ensure rejects missing, reordered, and extra arguments" \
+    "$(cat "$TEST_ROOT/order.out")" "ensure <directory> --repo <git-url>"
+fi
+
+if run_ensure "$ALLOWED/invalid repo" "-bad" >"$TEST_ROOT/unsafe-input.out" 2>&1 \
+  || run_ensure "$ALLOWED/invalid repo" "" >>"$TEST_ROOT/unsafe-input.out" 2>&1 \
+  || run_ensure "$ALLOWED/invalid repo" $'bad\nrepo' >>"$TEST_ROOT/unsafe-input.out" 2>&1 \
+  || run_ensure "$ALLOWED/invalid repo" $'bad\rrepo' >>"$TEST_ROOT/unsafe-input.out" 2>&1 \
+  || run_ensure $'bad\ndirectory' "$REMOTE_ONE" >>"$TEST_ROOT/unsafe-input.out" 2>&1; then
+  fail "ensure rejects unsafe repository and directory values"
+else
+  assert_contains "ensure rejects unsafe repository and directory values" \
+    "$(cat "$TEST_ROOT/unsafe-input.out")" "repository URL must not begin with -"
+fi
+
+ENSURE_FAILED="$ALLOWED/failed clone"
+if run_ensure "$ENSURE_FAILED" "$TEST_ROOT/does-not-exist.git" >"$TEST_ROOT/clone-failure.out" 2>&1; then
+  fail "clone failure leaves no destination or sibling temporary path"
+else
+  clone_temp_left=0
+  for clone_temp in "$ALLOWED"/.amp-runner-ensure.*; do
+    [ -e "$clone_temp" ] && clone_temp_left=1
+  done
+  if [ ! -e "$ENSURE_FAILED" ] && [ "$clone_temp_left" -eq 0 ]; then
+    pass "clone failure leaves no destination or sibling temporary path"
+  else
+    fail "clone failure leaves no destination or sibling temporary path"
+  fi
 fi
 
 INSTALL_HOME="$TEST_ROOT/install-home"

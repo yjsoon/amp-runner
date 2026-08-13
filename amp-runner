@@ -14,6 +14,7 @@ ALLOWED_ROOTS_FILE="$CONFIG_ROOT/allowed-roots"
 usage() {
   cat <<'EOF'
 Usage:
+  amp-runner ensure <directory> --repo <git-url>
   amp-runner start [directory]
   amp-runner status [directory]
   amp-runner stop [directory]
@@ -225,16 +226,17 @@ ensure_project_directories() {
 }
 
 run_with_lock() {
-  local operation=$1 directory=$2
+  local operation=$1 target=${2:-}
+  shift
   ensure_private_roots
   if [ "$PLATFORM" = macos ]; then
     command_exists lockf || die "lockf is required on macOS"
-    lockf -k -t 10 "$GLOBAL_LOCK" "$0" __project_lock "$operation" "$directory" \
-      || die "could not complete $operation for $directory (another operation may be running)"
+    lockf -k -t 10 "$GLOBAL_LOCK" "$0" __project_lock "$operation" "$@" \
+      || die "could not complete $operation for $target (another operation may be running)"
   else
     command_exists flock || die "flock is required on Linux"
-    flock -w 10 "$GLOBAL_LOCK" "$0" __project_lock "$operation" "$directory" \
-      || die "could not complete $operation for $directory (another operation may be running)"
+    flock -w 10 "$GLOBAL_LOCK" "$0" __project_lock "$operation" "$@" \
+      || die "could not complete $operation for $target (another operation may be running)"
   fi
 }
 
@@ -248,6 +250,175 @@ run_with_project_lock() {
   else
     flock -w 10 "$LOCK_FILE" "$0" "__$operation" "$PROJECT_PATH"
   fi
+}
+
+normalise_repository_url() {
+  NORMALISED_REPOSITORY_URL=$1
+  while [ "${NORMALISED_REPOSITORY_URL%/}" != "$NORMALISED_REPOSITORY_URL" ]; do
+    NORMALISED_REPOSITORY_URL=${NORMALISED_REPOSITORY_URL%/}
+  done
+  case $NORMALISED_REPOSITORY_URL in
+    *.git) NORMALISED_REPOSITORY_URL=${NORMALISED_REPOSITORY_URL%.git} ;;
+  esac
+}
+
+repository_urls_match() {
+  local expected=$1 actual=$2 normalised_expected
+  normalise_repository_url "$expected"
+  normalised_expected=$NORMALISED_REPOSITORY_URL
+  normalise_repository_url "$actual"
+  [ "$normalised_expected" = "$NORMALISED_REPOSITORY_URL" ]
+}
+
+resolve_ensure_destination() {
+  local requested=$1 parent basename output
+  reject_line_breaks "$requested" "directory path"
+  [ -n "$requested" ] || die "ensure directory must not be empty"
+  parent=$(dirname -- "$requested") || die "cannot resolve destination parent: $requested"
+  basename=$(basename -- "$requested") || die "cannot resolve destination basename: $requested"
+  case $basename in
+    .|..) die "destination basename must not be $basename" ;;
+    ''|/) die "invalid destination basename: $basename" ;;
+  esac
+  reject_line_breaks "$basename" "destination basename"
+  [ -d "$parent" ] || die "destination parent directory does not exist: $parent"
+  output=$(unset CDPATH; cd -- "$parent" 2>/dev/null && { pwd -P; printf '\034'; }) \
+    || die "cannot access destination parent: $parent"
+  ENSURE_PARENT=${output%$'\034'}
+  ENSURE_PARENT=${ENSURE_PARENT%$'\n'}
+  reject_line_breaks "$ENSURE_PARENT" "destination parent"
+  if [ "$ENSURE_PARENT" = / ]; then
+    ENSURE_DESTINATION="/$basename"
+  else
+    ENSURE_DESTINATION="$ENSURE_PARENT/$basename"
+  fi
+  reject_line_breaks "$ENSURE_DESTINATION" "destination path"
+  [ ! -L "$ENSURE_DESTINATION" ] \
+    || die "destination must not be a symbolic link: $ENSURE_DESTINATION"
+  if ! project_is_allowed "$ENSURE_DESTINATION"; then
+    die "directory is outside the configured allowed roots: $ENSURE_DESTINATION"
+  fi
+}
+
+directory_is_empty() (
+  local entries
+  shopt -s dotglob nullglob
+  entries=("$1"/*)
+  [ "${#entries[@]}" -eq 0 ]
+)
+
+verify_checkout() {
+  local destination=$1 expected=$2 top actual
+  top=$(git -C "$destination" rev-parse --show-toplevel 2>/dev/null) \
+    || die "existing nonempty directory is not a Git worktree root: $destination"
+  reject_line_breaks "$top" "Git worktree root"
+  canonical_directory_value "$top"
+  [ "$CANONICAL_DIRECTORY" = "$destination" ] \
+    || die "existing directory is not exactly a Git worktree root: $destination"
+  actual=$(git -C "$destination" config --get remote.origin.url 2>/dev/null) \
+    || die "existing Git checkout has no remote.origin.url: $destination"
+  reject_line_breaks "$actual" "repository origin URL"
+  if ! repository_urls_match "$expected" "$actual"; then
+    printf '%s: repository URL mismatch for %s\n' "$PROGRAM_NAME" "$destination" >&2
+    printf '%s: expected: %s\n' "$PROGRAM_NAME" "$expected" >&2
+    printf '%s: actual:   %s\n' "$PROGRAM_NAME" "$actual" >&2
+    exit 1
+  fi
+}
+
+create_clone_temp() {
+  local attempt=0 candidate
+  while [ "$attempt" -lt 100 ]; do
+    candidate="$ENSURE_PARENT/.amp-runner-ensure.$$.$attempt"
+    if mkdir "$candidate" 2>/dev/null; then
+      chmod 700 "$candidate" || {
+        safe_remove_tree "$candidate" >/dev/null 2>&1 || true
+        die "cannot secure clone temporary directory: $candidate"
+      }
+      ENSURE_TEMP=$candidate
+      return 0
+    fi
+    attempt=$((attempt + 1))
+  done
+  die "cannot create a private clone temporary directory in $ENSURE_PARENT"
+}
+
+clone_checkout() {
+  local repository=$1 top actual
+  create_clone_temp
+  if ! git clone -- "$repository" "$ENSURE_TEMP"; then
+    safe_remove_tree "$ENSURE_TEMP" \
+      || die "git clone failed and temporary checkout could not be removed: $ENSURE_TEMP"
+    die "git clone failed for $repository"
+  fi
+
+  top=$(git -C "$ENSURE_TEMP" rev-parse --show-toplevel 2>/dev/null || true)
+  actual=$(git -C "$ENSURE_TEMP" config --get remote.origin.url 2>/dev/null || true)
+  if [ -z "$top" ] || [ -z "$actual" ]; then
+    safe_remove_tree "$ENSURE_TEMP" \
+      || die "cloned checkout could not be verified or removed: $ENSURE_TEMP"
+    die "cloned repository is not a Git worktree with an origin: $repository"
+  fi
+  reject_line_breaks "$top" "cloned Git worktree root"
+  reject_line_breaks "$actual" "cloned repository origin URL"
+  canonical_directory_value "$top"
+  if [ "$CANONICAL_DIRECTORY" != "$ENSURE_TEMP" ] \
+    || ! repository_urls_match "$repository" "$actual"; then
+    safe_remove_tree "$ENSURE_TEMP" \
+      || die "cloned checkout did not match and could not be removed: $ENSURE_TEMP"
+    if ! repository_urls_match "$repository" "$actual"; then
+      printf '%s: repository URL mismatch for cloned checkout\n' "$PROGRAM_NAME" >&2
+      printf '%s: expected: %s\n' "$PROGRAM_NAME" "$repository" >&2
+      printf '%s: actual:   %s\n' "$PROGRAM_NAME" "$actual" >&2
+      exit 1
+    fi
+    die "cloned repository is not exactly a Git worktree root"
+  fi
+
+  if [ -e "$ENSURE_DESTINATION" ] || [ -L "$ENSURE_DESTINATION" ]; then
+    safe_remove_tree "$ENSURE_TEMP" \
+      || die "destination appeared and temporary checkout could not be removed: $ENSURE_TEMP"
+    die "destination appeared while cloning; leaving it untouched: $ENSURE_DESTINATION"
+  fi
+  if ! mv "$ENSURE_TEMP" "$ENSURE_DESTINATION"; then
+    safe_remove_tree "$ENSURE_TEMP" \
+      || die "cannot install checkout or remove temporary checkout: $ENSURE_TEMP"
+    die "cannot atomically install checkout at $ENSURE_DESTINATION"
+  fi
+  printf 'Cloned %s into %s.\n' "$repository" "$ENSURE_DESTINATION"
+}
+
+ensure_checkout() {
+  local requested=$1 repository=$2
+  [ ! -e "$CONFIG_ROOT/.uninstalling" ] || die "uninstall is in progress"
+  command_exists git || die "git is required"
+  reject_line_breaks "$repository" "repository URL"
+  [ -n "$repository" ] || die "repository URL must not be empty"
+  case $repository in -*) die "repository URL must not begin with -" ;; esac
+  resolve_ensure_destination "$requested"
+
+  if [ -L "$ENSURE_DESTINATION" ]; then
+    die "destination must not be a symbolic link: $ENSURE_DESTINATION"
+  elif [ -e "$ENSURE_DESTINATION" ] && [ ! -d "$ENSURE_DESTINATION" ]; then
+    die "destination exists and is not a directory: $ENSURE_DESTINATION"
+  elif [ -d "$ENSURE_DESTINATION" ]; then
+    if directory_is_empty "$ENSURE_DESTINATION"; then
+      rmdir "$ENSURE_DESTINATION" \
+        || die "cannot remove empty destination directory: $ENSURE_DESTINATION"
+      clone_checkout "$repository"
+    else
+      verify_checkout "$ENSURE_DESTINATION" "$repository"
+      printf 'Verified existing checkout at %s.\n' "$ENSURE_DESTINATION"
+    fi
+  else
+    clone_checkout "$repository"
+  fi
+
+  if [ "${AMP_RUNNER_TEST_MODE:-0}" = 1 ]; then
+    printf 'Test mode: prepared %s; skipped Amp and service manager start.\n' "$ENSURE_DESTINATION"
+    return 0
+  fi
+  run_with_project_lock start "$ENSURE_DESTINATION"
 }
 
 xml_escape() {
@@ -902,6 +1073,15 @@ main() {
   [ -n "$command" ] || { usage; exit 1; }
   shift || true
   case $command in
+    ensure)
+      [ "$#" -eq 3 ] || die "usage: amp-runner ensure <directory> --repo <git-url>"
+      [ "$2" = --repo ] || die "usage: amp-runner ensure <directory> --repo <git-url>"
+      reject_line_breaks "$1" "directory path"
+      reject_line_breaks "$3" "repository URL"
+      [ -n "$3" ] || die "repository URL must not be empty"
+      case $3 in -*) die "repository URL must not begin with -" ;; esac
+      run_with_lock ensure "$1" "$3"
+      ;;
     start)
       [ "$#" -le 1 ] || die "too many arguments for start"
       run_with_lock start "${1:-.}"
@@ -927,8 +1107,18 @@ main() {
       if [ "$command" = __start ]; then start_runner "$1"; else stop_runner "$1"; fi
       ;;
     __project_lock)
-      [ "$#" -eq 2 ] || die "invalid internal invocation"
-      case $1 in start|stop) run_with_project_lock "$1" "$2" ;; *) die "invalid internal operation" ;; esac
+      [ "$#" -ge 1 ] || die "invalid internal invocation"
+      case $1 in
+        start|stop)
+          [ "$#" -eq 2 ] || die "invalid internal invocation"
+          run_with_project_lock "$1" "$2"
+          ;;
+        ensure)
+          [ "$#" -eq 3 ] || die "invalid internal invocation"
+          ensure_checkout "$2" "$3"
+          ;;
+        *) die "invalid internal operation" ;;
+      esac
       ;;
     __uninstall)
       [ "$#" -eq 1 ] || die "invalid internal invocation"
